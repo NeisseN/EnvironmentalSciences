@@ -1,0 +1,185 @@
+----- 01. Overview --------------------------------------------------------------------------
+--- station wise
+--- mean temperature, mean daily temperature, mean night temperature, 
+--- a coefficient of variability and a count of all available records
+-- seperate temp values
+drop view if exists tmp cascade;
+create view tmp as
+	select 
+		*
+	from raw_data
+	where variable_id = 1;
+
+-- and light values
+drop view if exists light cascade;
+create view light as
+	select 
+		*
+	from raw_data
+	where variable_id = 2;
+
+-- temp and light into one
+drop view if exists tl cascade;
+create view tl as
+	select 
+		tmp.meta_id,
+		tmp.tstamp,
+		tmp.value as tmp,
+		light.value as light
+	from tmp
+	join light 
+		on light.meta_id = tmp.meta_id 
+		and light.tstamp = tmp.tstamp;
+
+-- 1st table mean of each hobo
+drop view if exists mt cascade;
+create view mt as
+	select 
+		meta_id,
+		avg(tmp) as omt
+	from tl
+	group by meta_id;
+	
+-- day mean temp 
+drop view if exists tday cascade;
+create view tday as
+	select 
+		meta_id,
+		avg(tmp) as dmt
+	from tl
+	where 
+		date_part('hour',tl.tstamp) >= 6 
+		and date_part('hour',tl.tstamp) <18
+	group by meta_id;
+	
+-- night mean temp
+drop view if exists tnight cascade;
+create view tnight as
+	select 
+		meta_id,
+		avg(tmp) as nmt
+	from tl
+	where 
+		date_part('hour',tl.tstamp) < 6 
+		or date_part('hour',tl.tstamp) >=18
+	group by meta_id;
+	
+-- temp variability
+drop view if exists var cascade;
+create view var as
+	select 
+		meta_id,
+		max(tmp) - min(tmp) as dif
+	from tl
+	group by meta_id;
+	
+-- counts
+drop view if exists N cascade;
+create view N as 
+	select 
+		meta_id,
+		count(meta_id)as n
+	from tl
+	group by meta_id;
+
+-- overview table 
+drop view if exists overv cascade; 
+-- if it was my database id probably create a table here and drop all ohter views  
+create view overv as
+	select
+		mt.meta_id,
+		mt.omt,
+		tday.dmt,
+		tnight.nmt,
+		var.dif,
+		N.n
+	from mt
+	join tday on mt.meta_id = tday.meta_id 
+	join tnight on mt.meta_id = tnight.meta_id
+	join var on mt.meta_id = var.meta_id
+	join N on mt.meta_id = N.meta_id;
+
+----- 02. Light categories-------------------------------------------------------------------
+--- on-the-fly categorization for light intensity observations
+drop view if exists cat;
+create view cat as
+	select 
+		tl.meta_id,
+		tl.tmp,
+	    tl.tstamp,
+		CASE 
+			WHEN tl.light < 10  THEN 'Night'
+			WHEN tl.light >= 10 AND tl.light < 500 THEN 'Sunrise/Sunset'
+			WHEN tl.light >= 500 AND tl.light < 2000 THEN 'Overcast(full)'
+			WHEN tl.light >= 2000 AND tl.light < 15000 THEN 'Overcast(light)'
+			WHEN tl.light >= 15000 AND tl.light < 20000 THEN 'Clear sky(shade)'
+			WHEN tl.light >= 20000 AND tl.light < 50000 THEN 'Sunshine'
+			WHEN tl.light >= 50000 AND tl.light <= 320000 THEN 'Sunshine(bright)'
+			ELSE 'fail'
+		END as category,
+		tl.light
+	From tl
+	order by meta_id, tstamp;
+	
+----- 03. Temperature summary by light ------------------------------------------------------
+--- temp mean value and a measure of variation 
+--- gourped by light
+select 
+	category,
+	avg(tmp) as tempcat,
+	stddev_pop(tmp) as std,
+	count(category) as ncat
+from cat
+group by category
+order by tempcat asc;
+
+----- 04. Spatial differences ---------------------------------------------------------------
+--- temp means grouped by city districts
+-- creating an overview
+-- matching the loggers with their related district
+drop view if exists hobofrei;
+create view hobofrei as
+	select
+		overv.omt as omt,
+		overv.meta_id,
+		metadata.location as holoc,
+		osm_nodes.name as distname,
+		osm_nodes.geom as district
+	from metadata
+	join osm_nodes on st_within(metadata.location, osm_nodes.geom)
+	join overv on metadata.id = overv.meta_id ;
+
+-- averaging the tempertaures 
+-- grouped by the districts
+drop view if exists spataildif;
+create view spataildif as
+	select 
+		distname,
+		avg(omt) omt,
+		count(omt)
+	from hobofrei
+	group by distname
+	order by omt;
+
+-- making temp categories 
+select
+	min(omt),
+	percentile_disc(0.25) within group (order by omt asc) as "25%",
+	percentile_disc(0.5) within group (order by omt asc) as "Median",
+	percentile_disc(0.75) within group (order by omt asc) as "75%",
+	max(omt)
+from spataildif;
+
+-- categorising the temperature means
+select 
+	distname,
+	omt,
+	count,
+	CASE 
+		WHEN omt < 5.591197818167468  THEN 'Low'
+		WHEN omt >= 5.591197818167468 AND omt < 6.491154711663827 THEN 'Moderate'
+		ELSE 'High'
+		END as tempcategory
+from spataildif
+order by omt;
+---------------------------------------------------------------------------------------------
